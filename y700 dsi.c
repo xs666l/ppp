@@ -1,39 +1,142 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * y700_dsi v2 - READ-ONLY investigation module for Lenovo Legion Y700 Gen4.
+ * y700_dsi v3 - Lenovo Legion Y700 Gen4 (SM8750) DSI mode-list tool.
  *
- * It never modifies anything. It only logs:
- *  1. every dsi_display_set_mode() call (as in v1)
- *  2. what dsi_display_get_modes() returns: the master list of display modes
- *     (full raw dump of each entry) and the offset of that list inside the
- *     dsi_display object. Trigger it with:
- *        echo detect > /sys/class/drm/card0-DSI-1/status
+ * Facts verified on this device (from v2 dumps):
+ *  - dsi_display_get_modes(display, &out) returns the driver's MASTER mode
+ *    list (display->modes, at display+0x318). Entries are 200 bytes (50 u32):
+ *      w0 h_active(1904)  w1 hbp(32)  w2 hsw(32)  w3 hfp   w6 v_active(3040)
+ *      w7 vbp  w8 vsw  w9 vfp  w11 refresh  w12 clk  w40 pixel_clk_khz
+ *      w46 mode index  w48/49 priv_info pointer
+ *  - all modes share one pixel clock (345984 kHz, both links); refresh rate
+ *    is set purely by the porches: fps = 172.992e6 / ((254+hbp+hsw+hfp)*vtotal)
+ *    per link, with every horizontal word being 2x the per-link value.
  *
- * Parameter: /sys/module/y700_dsi/parameters/dump (1 = log get_modes, default)
+ * What this module does:
+ *  - always: logs set_mode() calls.
+ *  - patch_list=1 : the next time the connector is probed
+ *        (echo detect > /sys/class/drm/card0-DSI-1/status)
+ *    the stock 165Hz entry (hfp 50, vbp 50, vfp 26) in the master list is
+ *    rewritten to hfp=<hfp>, refresh=<new_fps>, so the DRM modes AND the DSI
+ *    host are generated from the same, consistent timing.
+ *  - patch_list=0 : the next probe restores the original entry.
+ *  - unloading the module restores the entry too.
+ *
+ * Be on 120Hz or 60Hz (NOT 165Hz) when you apply or restore.
+ *
+ *  /sys/module/y700_dsi/parameters/{patch_list,hfp,new_fps,dump}
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/moduleparam.h>
 
-static int dump = 1;
+#define ENTRY_WORDS	50
+#define MAX_ENTRIES	8
+#define SRC_HFP2	100	/* stock 165Hz hfp, both links (2 x 50) */
+#define SRC_FPS		165
+
+static int patch_list;
+module_param(patch_list, int, 0644);
+MODULE_PARM_DESC(patch_list, "1 = rewrite the 165Hz list entry on next connector probe, 0 = restore");
+
+static int hfp = 40;
+module_param(hfp, int, 0644);
+MODULE_PARM_DESC(hfp, "per-link horizontal front porch for the rewritten entry (8..50); 40=170Hz 29=176Hz 22=180Hz 14=185Hz");
+
+static int new_fps = 170;
+module_param(new_fps, int, 0644);
+MODULE_PARM_DESC(new_fps, "refresh rate label written into the entry (166..190)");
+
+static int dump;
 module_param(dump, int, 0644);
-MODULE_PARM_DESC(dump, "1 = log dsi_display_get_modes results (default 1)");
+MODULE_PARM_DESC(dump, "1 = also dump the whole list on each probe");
+
+static u32 *last_modes;		/* master list, remembered for restore on unload */
+static int applied;		/* 1 while the list entry is currently patched */
+static u32 applied_hfp2, applied_fps;
 
 static inline bool kptr_ok(unsigned long p)
 {
 	return (s64)p < 0 && !(p & 3);
 }
 
-/* ---- v1 behaviour: log set_mode ---- */
+/* A list entry is valid only if it passes all of these (stride/layout check). */
+static bool entry_ok(const u32 *m, int idx)
+{
+	unsigned long priv = ((unsigned long)m[49] << 32) | m[48];
+
+	return m[0] == 1904 && m[1] == 32 && m[2] == 32 && m[6] == 3040 &&
+	       m[46] == (u32)idx && kptr_ok(priv);
+}
+
+static void restore_list(u32 *b)
+{
+	int e;
+
+	for (e = 0; e < MAX_ENTRIES; e++) {
+		u32 *m = b + e * ENTRY_WORDS;
+
+		if (!entry_ok(m, e))
+			break;
+		if (applied && m[3] == applied_hfp2 && m[11] == applied_fps &&
+		    m[7] == 50 && m[9] == 26) {
+			m[3] = SRC_HFP2;
+			m[11] = SRC_FPS;
+			applied = 0;
+			pr_info("y700_dsi: RESTORED list entry %d -> hfp=%u fps=%u\n", e, m[3], m[11]);
+		}
+	}
+}
+
+static void apply_list(u32 *b)
+{
+	int e;
+
+	if (hfp < 8 || hfp > 50 || new_fps < 166 || new_fps > 190) {
+		pr_warn("y700_dsi: parameters out of range (hfp=%d new_fps=%d), not patching\n", hfp, new_fps);
+		return;
+	}
+	for (e = 0; e < MAX_ENTRIES; e++) {
+		u32 *m = b + e * ENTRY_WORDS;
+
+		if (!entry_ok(m, e))
+			break;
+		if (!applied && m[3] == SRC_HFP2 && m[7] == 50 && m[9] == 26 &&
+		    m[11] == SRC_FPS) {
+			m[3] = 2 * hfp;
+			m[11] = new_fps;
+			applied = 1;
+			applied_hfp2 = m[3];
+			applied_fps = m[11];
+			pr_info("y700_dsi: PATCHED list entry %d -> hfp=%u fps=%u\n", e, m[3], m[11]);
+		}
+	}
+}
+
+static void dump_list(const u32 *b)
+{
+	int e;
+
+	for (e = 0; e < MAX_ENTRIES; e++) {
+		const u32 *m = b + e * ENTRY_WORDS;
+
+		if (!entry_ok(m, e))
+			break;
+		pr_info("y700_dsi: entry %d: hfp=%u vbp=%u vfp=%u fps=%u pclk_khz=%u idx=%u\n",
+			e, m[3], m[7], m[9], m[11], m[40], m[46]);
+	}
+}
+
+/* ---- set_mode logging ---- */
 static int sm_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	u32 *m = (u32 *)regs->regs[1];
 
 	if (!kptr_ok((unsigned long)m))
 		return 0;
-	pr_info("y700_dsi: set_mode %ux%u hbp=%u hsw=%u hfp=%u vbp=%u vsw=%u vfp=%u fps=%u clk=%u\n",
-		m[0], m[6], m[1], m[2], m[3], m[7], m[8], m[9], m[11], m[12]);
+	pr_info("y700_dsi: set_mode %ux%u hfp=%u vbp=%u vfp=%u fps=%u clk=%u\n",
+		m[0], m[6], m[3], m[7], m[9], m[11], m[12]);
 	return 0;
 }
 
@@ -42,96 +145,42 @@ static struct kprobe kp_sm = {
 	.pre_handler = sm_pre,
 };
 
-/* ---- v2: observe dsi_display_get_modes(display, &out_modes) ---- */
+/* ---- dsi_display_get_modes(display, &out_modes) ---- */
 struct gm_ctx {
-	unsigned long disp;
 	unsigned long out;
 };
 
 static int gm_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct gm_ctx *c = (struct gm_ctx *)ri->data;
-
-	c->disp = regs->regs[0];
-	c->out = regs->regs[1];
+	((struct gm_ctx *)ri->data)->out = regs->regs[1];
 	return 0;
-}
-
-#define SCAN_WORDS	256
-#define MAX_ENTRIES	8
-#define MAX_STRIDE	160
-#define DISP_SCAN_U64	768	/* 6 KB of the display object */
-
-static void dump_words(const char *tag, const u32 *w, int n)
-{
-	int j;
-
-	for (j = 0; j < n; j += 8)
-		pr_info("y700_dsi: %s+%d: %u %u %u %u %u %u %u %u\n", tag, j,
-			w[j], w[j + 1], w[j + 2], w[j + 3],
-			w[j + 4], w[j + 5], w[j + 6], w[j + 7]);
 }
 
 static int gm_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct gm_ctx *c = (struct gm_ctx *)ri->data;
-	unsigned long out = c->out, mp;
-	const u32 *b;
-	int idx[MAX_ENTRIES], n = 0, i, e, stride;
-	char tag[16];
+	unsigned long out = ((struct gm_ctx *)ri->data)->out, mp;
+	u32 *b;
 
-	if (!dump)
-		return 0;
-
-	pr_info("y700_dsi: get_modes ret=%ld display=%lx out=%lx\n",
-		(long)regs_return_value(regs), c->disp, out);
 	if (!kptr_ok(out) || (out & 7))
 		return 0;
-
 	mp = *(unsigned long *)out;
-	pr_info("y700_dsi: *out (modes array) = %lx\n", mp);
 	if (!kptr_ok(mp))
 		return 0;
-	b = (const u32 *)mp;
-
-	for (i = 0; i + 6 < SCAN_WORDS && n < MAX_ENTRIES; i++)
-		if (b[i] == 1904 && b[i + 1] == 32 && b[i + 2] == 32 && b[i + 6] == 3040)
-			idx[n++] = i;
-
-	pr_info("y700_dsi: found %d mode entries at word offsets: %d %d %d %d %d %d %d %d\n",
-		n, n > 0 ? idx[0] : -1, n > 1 ? idx[1] : -1, n > 2 ? idx[2] : -1,
-		n > 3 ? idx[3] : -1, n > 4 ? idx[4] : -1, n > 5 ? idx[5] : -1,
-		n > 6 ? idx[6] : -1, n > 7 ? idx[7] : -1);
-
-	stride = (n >= 2) ? idx[1] - idx[0] : 0;
-	if (stride <= 0 || stride > MAX_STRIDE)
-		stride = 64;
-	pr_info("y700_dsi: entry stride = %d words (%d bytes)\n", stride, stride * 4);
-
-	for (e = 0; e < n; e++) {
-		snprintf(tag, sizeof(tag), "mode%d", e);
-		dump_words(tag, b + idx[e], (stride + 7) & ~7);
+	b = (u32 *)mp;
+	if (!entry_ok(b, 0)) {
+		pr_warn("y700_dsi: get_modes list at %lx failed layout check, ignoring\n", mp);
+		return 0;
 	}
+	last_modes = b;
 
-	/* where does the display object keep the modes pointer / count? */
-	if (kptr_ok(c->disp) && !(c->disp & 7)) {
-		const unsigned long *d = (const unsigned long *)c->disp;
-		const u32 *d32 = (const u32 *)c->disp;
+	if (patch_list)
+		apply_list(b);
+	else if (applied)
+		restore_list(b);
 
-		for (i = 0; i < DISP_SCAN_U64; i++) {
-			if (d[i] == mp) {
-				int k;
-
-				pr_info("y700_dsi: display->modes pointer at byte offset 0x%x\n", i * 8);
-				for (k = 0; k < 16; k++) {
-					int w = i * 2 + k - 8;
-
-					if (w >= 0 && w < DISP_SCAN_U64 * 2 && d32[w] >= 1 && d32[w] <= 16)
-						pr_info("y700_dsi:   small u32 %u at byte offset 0x%x\n", d32[w], w * 4);
-				}
-			}
-		}
-	}
+	pr_info("y700_dsi: get_modes list=%lx patch_list=%d applied=%d\n", mp, patch_list, applied);
+	if (dump)
+		dump_list(b);
 	return 0;
 }
 
@@ -157,7 +206,7 @@ static int __init y700_dsi_init(void)
 		unregister_kprobe(&kp_sm);
 		return ret;
 	}
-	pr_info("y700_dsi: v2 loaded (read-only)\n");
+	pr_info("y700_dsi: v3 loaded (patch_list=%d, nothing changed until a connector probe)\n", patch_list);
 	return 0;
 }
 
@@ -165,11 +214,13 @@ static void __exit y700_dsi_exit(void)
 {
 	unregister_kretprobe(&krp_gm);
 	unregister_kprobe(&kp_sm);
-	pr_info("y700_dsi: unloaded\n");
+	if (applied && last_modes)
+		restore_list(last_modes);
+	pr_info("y700_dsi: unloaded (applied=%d)\n", applied);
 }
 
 module_init(y700_dsi_init);
 module_exit(y700_dsi_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Y700 Gen4 DSI read-only investigation module (v2)");
+MODULE_DESCRIPTION("Y700 Gen4 DSI master mode list tool (v3)");

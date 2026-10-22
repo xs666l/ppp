@@ -1,0 +1,125 @@
+name: build-y700-dsi
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo files
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          set -eo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 llvm-18 make bc flex bison \
+            libssl-dev libelf-dev dwarves git python3 zstd
+          clang-18 --version | head -1
+          pahole --version
+
+      - name: Fetch Android common kernel (android15-6.6)
+        run: |
+          set -eo pipefail
+          mkdir -p "$HOME/ack" && cd "$HOME/ack"
+          git init -q common && cd common
+          git remote add origin https://android.googlesource.com/kernel/common
+          ok=0
+          for ref in android15-6.6-2025-06 android15-6.6-2025-07 android15-6.6-2025-05 android15-6.6; do
+            echo "== trying $ref"
+            if git fetch --depth=1 origin "$ref"; then
+              git checkout -q FETCH_HEAD
+              echo "using ref: $ref"
+              ok=1
+              break
+            fi
+          done
+          [ "$ok" = 1 ] || { echo "could not fetch any android15-6.6 ref"; exit 1; }
+          git log -1 --format='commit %H%n%s'
+          sed -n '1,6p' Makefile
+
+      - name: Prepare kernel config (device config, build-only tweaks)
+        run: |
+          set -eo pipefail
+          cd "$HOME/ack/common"
+          cp "$GITHUB_WORKSPACE/device.config" .config
+          cp .config "$GITHUB_WORKSPACE/config.orig"
+          # only options that cannot change struct layouts, and that would break a headers-only build
+          scripts/config --file .config \
+            --set-str SYSTEM_TRUSTED_KEYS "" \
+            --set-str SYSTEM_REVOCATION_KEYS "" \
+            --disable TRIM_UNUSED_KSYMS \
+            --set-str UNUSED_KSYMS_WHITELIST ""
+          make ARCH=arm64 LLVM=-18 olddefconfig
+          norm() { grep -E '^(CONFIG_|# CONFIG_)' "$1" | sed -E 's/^# (CONFIG_[A-Za-z0-9_]+) is not set/\1=n/' | sort; }
+          diff <(norm "$GITHUB_WORKSPACE/config.orig") <(norm .config) > "$GITHUB_WORKSPACE/config-diff.txt" || true
+          echo "config differences vs device config: $(wc -l < "$GITHUB_WORKSPACE/config-diff.txt") lines"
+          head -60 "$GITHUB_WORKSPACE/config-diff.txt"
+          # these must survive, otherwise the module would not match the running kernel
+          for o in CFI_CLANG SHADOW_CALL_STACK MODVERSIONS MODULE_SIG DEBUG_INFO_BTF_MODULES \
+                   KPROBES ARM64_PTR_AUTH_KERNEL STACKPROTECTOR_PER_TASK MODULE_UNLOAD SMP PREEMPT; do
+            grep -q "^CONFIG_$o=y" .config || { echo "ERROR: CONFIG_$o was dropped or disabled"; exit 1; }
+          done
+
+      - name: Prepare headers (modules_prepare)
+        run: |
+          set -eo pipefail
+          cd "$HOME/ack/common"
+          cp "$GITHUB_WORKSPACE/Module.symvers" Module.symvers
+          make ARCH=arm64 LLVM=-18 -j"$(nproc)" modules_prepare 2>&1 | tee "$GITHUB_WORKSPACE/prepare.log" | tail -30
+
+      - name: Build y700_dsi.ko
+        run: |
+          set -eo pipefail
+          mkdir -p "$RUNNER_TEMP/mod"
+          cp "$GITHUB_WORKSPACE/y700_dsi.c" "$GITHUB_WORKSPACE/Kbuild" "$RUNNER_TEMP/mod/"
+          make -C "$HOME/ack/common" ARCH=arm64 LLVM=-18 M="$RUNNER_TEMP/mod" modules 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log" | tail -60
+          ls -la "$RUNNER_TEMP/mod/y700_dsi.ko"
+          cp "$RUNNER_TEMP/mod/y700_dsi.ko" "$GITHUB_WORKSPACE/y700_dsi.ko"
+
+      - name: Inspect the module (vermagic, CRCs)
+        run: |
+          set -eo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 - <<'PY'
+          import struct, sys
+          d = open('y700_dsi.ko','rb').read()
+          shoff, = struct.unpack_from('<Q', d, 0x28)
+          shentsize, shnum, shstrndx = struct.unpack_from('<HHH', d, 0x3A)
+          secs = []
+          for i in range(shnum):
+              o = shoff + i*shentsize
+              name, typ, flags, addr, off, size, link, info, align, entsz = struct.unpack_from('<IIQQQQIIQQ', d, o)
+              secs.append((name, off, size))
+          shstr = secs[shstrndx]
+          def sname(n):
+              b = shstr[1] + n
+              return d[b:d.index(b'\0', b)].decode()
+          byname = {sname(s[0]): s for s in secs}
+          vm = d.find(b'vermagic=')
+          print('vermagic:', d[vm:d.index(b'\0', vm)].decode())
+          v = byname.get('__versions')
+          print('imported symbols (name, crc):')
+          for i in range(v[2]//64):
+              crc, = struct.unpack_from('<Q', d, v[1]+i*64)
+              nm = d[v[1]+i*64+8:v[1]+i*64+64].split(b'\0')[0].decode()
+              print('  %-24s 0x%08x' % (nm, crc & 0xffffffff))
+          expect = b'SMP preempt mod_unload modversions aarch64'
+          if expect not in d:
+              print('ERROR: unexpected vermagic flags'); sys.exit(1)
+          PY
+
+      - name: Upload module and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: y700_dsi
+          path: |
+            y700_dsi.ko
+            config-diff.txt
+            prepare.log
+            build.log
+          if-no-files-found: warn
